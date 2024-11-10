@@ -3,258 +3,200 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/msg.h>
-#include <sys/sem.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
-#include <string.h>
-#include <time.h>
-#include <limits.h>
+#include <stdbool.h>
 
-#define P(s) semop(s, &pop, 1)
-#define V(s) semop(s, &vop, 1)
+struct page_table {
+    int frame_number;
+    bool valid_bit;
+};
 
-typedef struct SM1
-{
-    int semid;              // semaphore id
-    int pid;                // process id
-    int pages_req;          // number of required pages
-    int frames_alloc;       // number of frames allocated
-    int pagetable[1000][3]; // page table
-    int page_faults;
-    int access_illegal;
-} SM1;
+// For mq3
+struct msg3_buffer {
+    long msg_type;
+    struct msg3 {
+        int pg_num;
+        int index;
+    }msg;
+}; 
 
-typedef struct message2
-{
-    long type;
-    struct msg_2
-    {
-        int pid;
-        int msg_type;
-    } msg_2;
-} message2;
+// For mq2
+struct msg2_buffer {
+    long msg_type;
+    struct msg2 {
+        int type_of_msg;
+    } msg;
+};
 
-typedef struct message3
-{
-    long type;
-    struct msg_3
-    {
-        int pageorframe;
-        int pid;
-    } msg_3;
-} message3;
 
-FILE *fp;
+void PageFaultHandler(struct page_table * page_table, int * free_frame_list, int page_number, int process_idx, int m, int global_timestamp, int * last_used){
+    int page_table_idx = process_idx * m + page_number;
+    if(free_frame_list[0] > 0){
+        // Use the last available frame to insert in to the page table
+        page_table[page_table_idx].frame_number = free_frame_list[free_frame_list[0]--];
+        page_table[page_table_idx].valid_bit = true;
+        last_used[page_table_idx] = global_timestamp;
+    }
+    else{
+        // Use local replacement using LRU
+        int victim_page_idx = process_idx * m;
+        int min_timestamp = global_timestamp;
+        for(int i = 0; i<m; ++i){
+            if(last_used[process_idx*m + i] < min_timestamp && page_table[process_idx*m + i].valid_bit == true){
+                min_timestamp = last_used[process_idx*m + i];
+                victim_page_idx = process_idx*m + i;
+            }
+        }
+        page_table[victim_page_idx].valid_bit = false;
+        last_used[victim_page_idx] = -1;
+        page_table[page_table_idx].frame_number = page_table[victim_page_idx].frame_number;
+        page_table[page_table_idx].valid_bit = true;
+        last_used[page_table_idx] = global_timestamp;
+    }
 
-void print(char *str)
-{
-    // usleep(100000);
-    fp = fopen("result.txt", "a");
-    fprintf(fp, "%s", str);
-    fflush(fp);
-    fclose(fp);
-    // sleep(1);
-    printf("%s", str);
 }
 
-int main(int argc, char *argv[])
-{
-    int tim = 0;
-    // FILE *fptr;
-    fp = fopen("result.txt", "w");
-    fclose(fp);
-
-    struct sembuf pop = {0, -1, 0};
-    struct sembuf vop = {0, 1, 0};
-
-    if (argc != 5)
-    {
-        printf("Usage: %s <Message Queue 2 ID> <Message Queue 3 ID> <Shared Memory 1 ID> <Shared Memory 2 ID>\n", argv[0]);
+int main(int argc, char *argv[]) {
+    if (argc != 8) {
+        printf("Wrong number of arguments\n");
         exit(1);
     }
 
-    int msgid2 = atoi(argv[1]);
-    int msgid3 = atoi(argv[2]);
-    int shmid1 = atoi(argv[3]);
-    int shmid2 = atoi(argv[4]);
+    // Convert command line arguments
+    int mq2 = atoi(argv[1]);
+    int mq3 = atoi(argv[2]);
+    int shm1 = atoi(argv[3]);
+    int shm2 = atoi(argv[4]);
+    int shm3 = atoi(argv[5]);
+    int m = atoi(argv[6]);
+    int k = atoi(argv[7]);
 
-    message2 msg2;
-    message3 msg3;
+    // Attach to shared memory
+    struct page_table * page_table = (struct page_table *) shmat(shm1, NULL, 0);
+    int * free_frame_list = (int *) shmat(shm2, NULL, 0);
+    int * page_number_mapping = (int *) shmat(shm3, NULL, 0);
 
-    SM1 *sm1 = (SM1 *)shmat(shmid1, NULL, 0);
-    int *sm2 = (int *)shmat(shmid2, NULL, 0);
+    // Global timestamp
+    int global_timestamp = 0;
 
-    key_t key;
-    key = ftok(".", 11);
-    int semid5 = semget(key, 1, IPC_CREAT | 0666);
+    int * last_used = (int *) malloc(k*m * sizeof(int));            // For LRU
+    for(int i = 0; i<k*m; i++) last_used[i] = -1;                   // Initialize with -1 (Never used)
 
-    key = ftok(".", 12);
-    int semid6 = semget(key, 1, IPC_CREAT | 0666);
-    char msg[100];
+    // Output file
+    FILE *output_file = fopen("result.txt", "w");
 
-    while (1)
-    {
-        // wait for process to come
-        // P(semid6);
-        msgrcv(msgid3, (void *)&msg3, sizeof(msg3.msg_3), 2, 0);
-        tim++;
+    int *page_fault_count = calloc(k, sizeof(int)); // Array to keep track of page faults for each process
+    int *invalid_page_ref_count = calloc(k, sizeof(int)); // Array to keep track of invalid page references for each process
+    int t = k;              // Copy of k for later use
 
-        int i = 0;
-        while (sm1[i].pid != msg3.msg_3.pid)
-        {
-            i++;
-        }
-        memset(msg, 0, sizeof(msg));
-        sprintf(msg, "Global Ordering - (tim %d, Process %d, Page %d)\n", tim, msg3.msg_3.pid, msg3.msg_3.pageorframe);
-        print(msg);
+    while(k>0) {
+        // Wait for a page number from any process
+        struct msg3_buffer demand;
+        struct msg3_buffer supply;
 
-        // printf("Global Ordering - (tim %d, Process %d, Page %d)\n", tim, msg3.msg_3.pid, msg3.msg_3.pageorframe);
-        // printf("page table: %d %d %d\n", sm1[i].pagetable[0][0], sm1[i].pagetable[0][1], sm1[i].pagetable[0][2]);
+        supply.msg_type = 2;
 
-        // check if the requested page is in the page table of the process with that pid
+        struct msg2_buffer msg2;
+        msg2.msg_type = 1;
 
-        int page = msg3.msg_3.pageorframe;
-        if (sm1[i].pagetable[page][0] != -1 && sm1[i].pagetable[page][1] == 1)
-        {
-            // page there in memory and valid, return frame number
-            sm1[i].pagetable[page][2] = tim;
-            msg3.msg_3.pageorframe = sm1[i].pagetable[page][0];
-            msg3.type = 1;
-            msgsnd(msgid3, (void *)&msg3, sizeof(msg3.msg_3), 0);
-            // V(semid5);
-        }
-        else if (page == -9)
-        {
-            // process is done
-            // free the frames
-            memset(msg, 0, sizeof(msg));
-            sprintf(msg, "\t\tProcess %d completed\n\t\tNumber of page faults: %d, Number of illegal accesses: %d\n", msg3.msg_3.pid, sm1[i].page_faults, sm1[i].access_illegal);
-            print(msg);
-            for (int j = 0; j < sm1[i].pages_req; j++)
-            {
-                if (sm1[i].pagetable[j][0] != -1)
-                {
-                    sm2[sm1[i].pagetable[j][0]] = 1;
-                    sm1[i].pagetable[j][0] = -1;
-                    sm1[i].pagetable[j][1] = 0;
-                    sm1[i].pagetable[j][2] = INT_MAX;
-                }
-            }
-            msg2.type = 1;
-            msg2.msg_2.pid = msg3.msg_3.pid;
-            msg2.msg_2.msg_type = 2;
-            printf("Process %d has finished 1\n", msg2.msg_2.pid);
-            msgsnd(msgid2, (void *)&msg2, sizeof(msg2.msg_2), 0);
-        }
+        msgrcv(mq3, &demand, sizeof(demand.msg), 1, 0); // Get the page number from the process
 
-        else if (page >= sm1[i].pages_req)
-        {
-            // illegal page number
-            // ask process to kill themselves
-            msg3.msg_3.pageorframe = -2;
-            msg3.type = 1;
-            msgsnd(msgid3, (void *)&msg3, sizeof(msg3.msg_3), 0);
-            // V(semid5);
-            memset(msg, 0, sizeof(msg));
-            sprintf(msg, "Invalid Page Reference - (Process %d, Page %d)\n", i + 1, page);
-            print(msg);
-            sm1[i].access_illegal++;
-            memset(msg, 0, sizeof(msg));
-            sprintf(msg, "\t\tProcess %d terminated on illegal access\n\t\tNumber of page faults: %d, Number of illegal accesses: %d\n", msg3.msg_3.pid, sm1[i].page_faults, sm1[i].access_illegal);
-            print(msg);
+        global_timestamp++; // Increment global timestamp
 
-            printf("Invalid Page Reference - (Process %d, Page %d)\n", i + 1, page);
+        int page_number = demand.msg.pg_num;
+        int process_idx = demand.msg.index;
+        int m_process = page_number_mapping[process_idx]; // Number of pages for the process
 
-            // free the frames
-            for (int j = 0; j < sm1[i].pages_req; j++)
-            {
-                if (sm1[i].pagetable[j][0] != -1)
-                {
-                    sm2[sm1[i].pagetable[j][0]] = 1;
-                    sm1[i].pagetable[j][0] = -1;
-                    sm1[i].pagetable[j][1] = 0;
-                    sm1[i].pagetable[j][2] = 1e9;
-                }
-            }
-
-            msg2.type = 1;
-            msg2.msg_2.pid = msg3.msg_3.pid;
-            msg2.msg_2.msg_type = 2;
+        if (page_number == -9) {
+            // Process has finished
+            k--;
             
-            printf("Process %d has been terminated 2\n", msg2.msg_2.pid);
-            msgsnd(msgid2, (void *)&msg2, sizeof(msg2.msg_2), 0);
-        }
-        else
-        {
-            // page fault
-            // ask process to wait
-            msg3.msg_3.pageorframe = -1;
-            msg3.type = 1;
-            msgsnd(msgid3, (void *)&msg3, sizeof(msg3.msg_3), 0);
-            // V(semid5);
-            sm1[i].page_faults++;
-            memset(msg, 0, sizeof(msg));
-            sprintf(msg, "Page fault sequence - (Process %d, Page %d)\n", i + 1, page);
-            print(msg);
-
-            printf("Page fault sequence - (Process %d, Page %d)\n", i + 1, page);
-
-            // Page Fault Handler (PFH)
-            // check if there is a free frame in sm2
-            int j = 0 ,flag=0;
-            while (sm2[j] != -1)
-            {
-                if (sm2[j] == 1)
-                {
-                    sm2[j] = 0;
-                    flag = 1;
-                    break;
+            // Free the allocated frames back to free frames list
+            int page_idx_base = process_idx * m;
+            for(int i = 0; i<m_process; ++i){
+                if(page_table[page_idx_base + i].frame_number != -1 && page_table[page_idx_base + i].valid_bit == true){
+                    free_frame_list[++free_frame_list[0]] = page_table[page_idx_base + i].frame_number;
+                    page_table[page_idx_base + i].frame_number = -1;
+                    page_table[page_idx_base + i].valid_bit = false;
                 }
-                j++;
             }
-            if (flag)
-            {
-                // free frame found
-                sm1[i].pagetable[page][0] = j;
-                sm1[i].pagetable[page][1] = 1;
-                sm1[i].pagetable[page][2] = tim;
 
-                msg2.type = 1;
-                msg2.msg_2.pid = msg3.msg_3.pid;
-                msg2.msg_2.msg_type = 1;
-                printf("Process %d has been terminated 4\n", msg2.msg_2.pid);
-                msgsnd(msgid2, (void *)&msg2, sizeof(msg2.msg_2), 0);
-            }
-            else
-            {
-                // no free frame
-                // find the page with the least time of access
-                int min = INT_MAX;
-                int minpage = -1;
-                for (int k = 0; k < sm1[i].pages_req; k++)
-                {
-                    if (sm1[i].pagetable[k][2] < min)
-                    {
-                        min = sm1[i].pagetable[k][2];
-                        minpage = k;
+            // Send Type II message to Scheduler
+            msg2.msg.type_of_msg = 2;
+            msgsnd(mq2, &msg2, sizeof(msg2.msg), 0);
+        } else {
+            if(page_number >= m_process) {
+                // Invalid page number
+                printf("TRYING TO ACCESS INVALID PAGE REFERENCE\n");
+                fflush(stdout);
+                printf("Invalid page reference - (p%d,x%d)\n", process_idx, page_number);
+                fflush(stdout);
+
+                fprintf(output_file, "Invalid page reference - (p%d,x%d)\n", process_idx, page_number);
+                invalid_page_ref_count[process_idx]++;
+
+                // Process was terminated
+                k--;
+            
+                // Free the allocated frames back to free frames list
+                int page_idx_base = process_idx * m;
+                for(int i = 0; i<m_process; ++i){
+                    if(page_table[page_idx_base + i].frame_number != -1 && page_table[page_idx_base + i].valid_bit == true){
+                        free_frame_list[++free_frame_list[0]] = page_table[page_idx_base + i].frame_number;
+                        page_table[page_idx_base + i].frame_number = -1;
+                        page_table[page_idx_base + i].valid_bit = false;
                     }
                 }
 
-                sm1[i].pagetable[minpage][1] = 0;
-                sm1[i].pagetable[page][0] = sm1[i].pagetable[minpage][0];
-                sm1[i].pagetable[page][1] = 1;
-                sm1[i].pagetable[page][2] = tim;
-                sm1[i].pagetable[minpage][2] = INT_MAX;
+                supply.msg.pg_num = -2;
+                supply.msg.index = process_idx;
+                msgsnd(mq3, &supply, sizeof(supply.msg), 0);
 
-                msg2.type = 1;
-                msg2.msg_2.pid = msg3.msg_3.pid;
-                msg2.msg_2.msg_type = 1;
-                printf("Process %d has been terminated 3\n", msg2.msg_2.pid);
-                msgsnd(msgid2, (void *)&msg2, sizeof(msg2.msg_2), 0);
+                msg2.msg.type_of_msg = 2;
+                msgsnd(mq2, &msg2, sizeof(msg2.msg), 0);
+            } else {
+                int page_table_idx = process_idx * m + page_number;
+                if(page_table[page_table_idx].valid_bit == false) {
+                    // Page is not valid
+                    printf("Page fault - (p%d,x%d)\n", process_idx, page_number);
+                    fprintf(output_file, "Page fault - (p%d,x%d)\n", process_idx, page_number);
+                    page_fault_count[process_idx]++;
+
+                    PageFaultHandler(page_table, free_frame_list, page_number, process_idx, m, global_timestamp, last_used);
+                    supply.msg.pg_num = -1;
+                    supply.msg.index = process_idx;
+                    msg2.msg.type_of_msg = 1;
+                    msgsnd(mq3, &supply, sizeof(supply.msg), 0);
+                    msgsnd(mq2, &msg2, sizeof(msg2.msg), 0);
+                } else {
+                    // Page is in memory
+                    last_used[page_table_idx] = global_timestamp; // Update the timestamp
+                    supply.msg.pg_num = page_table[page_table_idx].frame_number;
+                    supply.msg.index = process_idx;
+                    msgsnd(mq3, &supply, sizeof(supply.msg), 0);
+                }
             }
+            printf("Global ordering - (t%d,p%d,x%d)\n", global_timestamp, process_idx, page_number);
+            fprintf(output_file, "Global ordering - (t%d,p%d,x%d)\n", global_timestamp, process_idx, page_number);
         }
     }
-    shmdt(sm1);
-    shmdt(sm2);
+
+    // Print and write total counts
+    for(int i = 0; i < t; i++) {
+        printf("Total page faults for process p%d: %d\n", i, page_fault_count[i]);
+        printf("Total invalid page references for process p%d: %d\n", i, invalid_page_ref_count[i]);
+        fprintf(output_file, "Total page faults for process p%d: %d\n", i, page_fault_count[i]);
+        fprintf(output_file, "Total invalid page references for process p%d: %d\n", i, invalid_page_ref_count[i]);
+    }
+
+    fclose(output_file);
+    free(page_fault_count);
+    free(invalid_page_ref_count);
+
+    // Cleanup before exit
+    shmdt(page_table);
+    shmdt(free_frame_list);
+
+    return 0;
 }
