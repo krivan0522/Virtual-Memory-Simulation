@@ -1,159 +1,76 @@
-#include <stdio.h>
 #include <stdlib.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/msg.h>
-#include <sys/sem.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
+#include <signal.h>
 #include <string.h>
-#include <time.h>
 
-#define P(s) semop(s, &pop, 1)
-#define V(s) semop(s, &vop, 1)
-
-typedef struct message1
-{
-    long type;
-    struct msg_1{
+struct msg1_buffer {
+    long msg_type;
+    struct msg1 {
         int pid;
-    }msg_1;
-} message1;
+    } msg;
+};                                          // To push into the ready queue
 
-typedef struct message3
-{
-    long type;
-    struct msg{
-        int pageorframe;
-        int pid;
+struct msg3_buffer {
+    long msg_type;
+    struct msg3 {
+        int pg_num;
+        int index;
     }msg;
-} message3;
+};                                          // To request for a page from mq3
 
-typedef struct SM1
-{
-    int semid;      // semaphore id
-    int pid;         // process id
-    int pages_req;          // number of required pages
-    int frames_alloc;          // number of frames allocated
-    int pagetable[1000][3]; // page table
-    int page_faults;
-    int access_illegal;
-} SM1;
+int main(int argc, char * argv[]) {
+    int mq1 = atoi(argv[1]);
+    int mq3 = atoi(argv[2]);
+    char * refstr = argv[3];
+    int p_ind = atoi(argv[4]);
 
-int main(int argc, char *argv[])
-{
-    struct sembuf pop = {0, -1, 0};
-    struct sembuf vop = {0, 1, 0};
+    // Attach in ready queue
+    struct msg1_buffer msg1;
+    msg1.msg_type = 1;
+    msg1.msg.pid = getpid();
+    msgsnd(mq1, &msg1, sizeof(msg1.msg), 0);
 
-    if (argc != 6)
-    {
-        printf("Usage: %s <Reference String> <Virtual Address Space size> <Physical Address Space size> <# Processes> <Shared Memory SM1>\n", argv[0]);
-        exit(1);
-    }
+    // Pause until scheduler wakes up
+    kill(getpid(), SIGSTOP);
 
-    int msgid1 = atoi(argv[2]);
-    int msgid3 = atoi(argv[3]);
-    int k = strlen(argv[4]);
-    int shmid1 = atoi(argv[5]);
-    char *refstr = (char*)malloc((strlen(argv[1])+1)*sizeof(char));
-    strcpy(refstr, argv[1]);
+    struct msg3_buffer msg3;
 
-    printf("Process has started\n");
-    key_t key = ftok(".", 4);
-    int semid = semget(key, 1, IPC_CREAT | 0666);
-
-    int sem_array[k];
-
-    for(int i = 0;i<k;i++){
-        key_t key = ftok(".", 100+i);
-        sem_array[i] = semget(key, 1, IPC_CREAT | 0666);
-    }
-
-    SM1 *sm1 = (SM1 *)shmat(shmid1, NULL, 0);
-
-    int pid = getpid();
-    int curr = 0;
-
-    while(sm1[curr].pid != pid){
-        curr++;
-    }
-
-    message1 msg1;
-    msg1.type = 1;
-    msg1.msg_1.pid = pid;
-
-    key = ftok(".", 11);
-    int semid5 = semget(key, 1, IPC_CREAT | 0666);
-
-    key = ftok(".", 12);
-    int semid6 = semget(key, 1, IPC_CREAT | 0666);
-
-    // send pid to ready queue
-    printf("pid: %d\n", pid);   
-    msgsnd(msgid1, (void *)&msg1, sizeof(msg1.msg_1), 0);
-
-    // wait till scheduler signals to start
-    P(sem_array[curr]);
-
-    // send the reference string to the scheduler, one character at a time
-    int i = 0;
-    while (refstr[i] != '\0')
-    {
-        message3 msg3;
-        msg3.msg.pid = pid;
-        int j = 0;
-        // extract the page number from the reference string going character by character
-        while (refstr[i] != '.' && refstr[i] != '\0')
-        {
-            j = (refstr[i] - '0') + j * 10  ;
-            i++;
+    char * ref = strtok(refstr, " ");
+    int page_fault_occurred = 0; // Flag to restart if page fault occurs
+    while (ref != NULL) {
+        if (atoi(ref) == -9){
+            // Terminate the process
+            msg3.msg_type = 1;
+            msg3.msg.pg_num = -9;
+            msg3.msg.index = p_ind;
+            msgsnd(mq3, &msg3, sizeof(msg3.msg), 0);
+            break;
         }
-        i++;
-        msg3.msg.pageorframe = j;
-        msg3.type = 2;
-        msgsnd(msgid3, (void *)&msg3, sizeof(msg3.msg), 0);
-        // V(semid6);
 
-        // P(semid5);
-        // wait for the mmu to allocate the frame type is pid of the process
-        msgrcv(msgid3, (void *)&msg3, sizeof(msg3.msg),1, 0);
+        msg3.msg_type = 1;          // Request for a page
+        msg3.msg.pg_num = atoi(ref);
+        msg3.msg.index = p_ind;     // Index of the process (0 based)
+        msgsnd(mq3, &msg3, sizeof(msg3.msg), 0);
 
-        // check the validity of the frame number
-        if (msg3.msg.pageorframe == -2)
-        {
-            printf("Process %d: ", pid);
-            printf("Illegal Page Number\nTerminating\n");
-            exit(1);
+        msgrcv(mq3, &msg3, sizeof(msg3.msg), 2, 0);     // Get the frame from mmu
+        if (msg3.msg.pg_num == -1) {
+            // Page fault
+            page_fault_occurred = 1;     // Setting the flag to 1 if a page fault occurs
+            kill(getpid(), SIGSTOP);
+            page_fault_occurred = 0;     // Reset the flag immediately after stopping the process
         }
-        else if (msg3.msg.pageorframe == -1)
-        {
-            printf("Process %d: ", pid);
-            printf("Page Fault\nWaiting for page to be loaded\n");
-            // wait for the page to be loaded
-            // scheduler will signal when the page is loaded
-            P(sem_array[curr]);
-            continue;
+        else if (msg3.msg.pg_num == -2) {
+            exit(0);
         }
-        else
-        {
-            printf("Process %d: ", pid);
-            printf("Frame %d allocated\n", msg3.msg.pageorframe);
+        else {
+            // Got valid page, go to next.
+            if (!page_fault_occurred) {     // Only advance to the next token if no page fault occurred
+                ref = strtok(NULL, " ");
+            }
         }
     }
-
-    // send the termination signal to the mmu
-    printf("Process %d: ", pid);
-    printf("Received all frames, now terminating\n");
-    message3 msg3;
-    msg3.type = 2;
-    msg3.msg.pid = pid;
-    msg3.msg.pageorframe = -9;
-
-    msgsnd(msgid3, (void *)&msg3, sizeof(msg3.msg), 0);
-    // V(semid6);
-
-    shmdt(sm1);
-
     return 0;
 }
