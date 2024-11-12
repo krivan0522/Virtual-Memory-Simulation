@@ -87,7 +87,7 @@ int main() {
     // Create scheduler
     int scheduler_pid = fork();
     if (scheduler_pid == 0) {
-        char *args[] = {"./scheduler", mq1_str, mq2_str, k_str, NULL};
+        char *args[] = {"./sched", mq1_str, mq2_str, k_str, NULL};
         execvp(args[0], args);
     }
 
